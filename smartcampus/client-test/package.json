@@ -5,7 +5,7 @@
   "scripts": {
     "test": "node test.mjs"
   },
-  "license": "ISC",
+  "license": "MIT",
   "type": "module",
   "dependencies": {
     "@bacnet-js/client": "^3.3.2"
