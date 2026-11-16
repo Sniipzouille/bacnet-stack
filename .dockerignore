@@ -1,0 +1,7 @@
+# Fichiers exclus du contexte de construction Docker (smartcampus/docker/Dockerfile)
+.git
+bin/bac*
+bin/*.exe
+**/*.o
+**/*.a
+smartcampus/client-test/node_modules

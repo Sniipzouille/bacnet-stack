@@ -1,0 +1,5 @@
+# Objets créés après le démarrage du conteneur par
+# smartcampus/scripts/create-dynamic-objects.sh
+# <type> <instance> <nom> [valeur]
+analog-value 10 Consigne-C04 19.5
+analog-value 11 Temperature-C04 18.0

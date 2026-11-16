@@ -1,0 +1,30 @@
+# Lancement du serveur BACnet SmartCampus sur le Raspberry Pi.
+#   docker compose -f smartcampus/docker/compose.yaml up -d
+#   docker compose -f smartcampus/docker/compose.yaml logs -f
+services:
+  bacnet:
+    image: smartcampus/bacnet:latest
+    build:
+      context: ../..
+      dockerfile: smartcampus/docker/Dockerfile
+    container_name: smartcampus-bacnet
+    # Le réseau de l'hôte est indispensable : BACnet utilise le broadcast UDP
+    # (Who-Is / I-Am) que YABE envoie à tout le réseau local.
+    network_mode: host
+    # Redémarre le serveur s'il s'arrête et au démarrage du Pi
+    # (remplace le service systemd utilisé avant).
+    restart: unless-stopped
+    environment:
+      # Interface réseau du Pi utilisée par BACnet (wlan0 en point d'accès,
+      # eth0 sur le réseau filaire du client).
+      BACNET_IFACE: ${BACNET_IFACE:-wlan0}
+      BACNET_VERBOSE: "1"
+    volumes:
+      # Sauvegarde automatique des objets, conservée entre deux conteneurs.
+      - smartcampus-data:/data
+      # Configuration des objets, modifiable sans reconstruire l'image
+      # (la section "static" demande, elle, de reconstruire l'image).
+      - ../config/objects.json:/etc/smartcampus/objects.json:ro
+
+volumes:
+  smartcampus-data:
