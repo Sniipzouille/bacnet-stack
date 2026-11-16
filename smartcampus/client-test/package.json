@@ -1,0 +1,13 @@
+{
+  "name": "smartcampus-client-test",
+  "version": "1.0.0",
+  "description": "Test du client BACnet.js contre le serveur SmartCampus",
+  "scripts": {
+    "test": "node test.mjs"
+  },
+  "license": "ISC",
+  "type": "module",
+  "dependencies": {
+    "@bacnet-js/client": "^3.3.2"
+  }
+}
