@@ -27,13 +27,13 @@
 /* DoS guard: maximum List_Of_Object_Property_References entries (resizable
    BACnetLIST, backed by an OS_Keylist, up to this many per object) */
 #ifndef BACNET_SCHEDULE_OBJ_PROP_REF_SIZE
-#define BACNET_SCHEDULE_OBJ_PROP_REF_SIZE 4
+#define BACNET_SCHEDULE_OBJ_PROP_REF_SIZE 128
 #endif
 
 /* DoS guard: maximum Exception_Schedule entries (resizable BACnetARRAY,
    backed by an OS_Keylist, up to this many per object) */
 #ifndef BACNET_EXCEPTION_SCHEDULE_SIZE
-#define BACNET_EXCEPTION_SCHEDULE_SIZE 8
+#define BACNET_EXCEPTION_SCHEDULE_SIZE 128
 #endif
 
 /* DoS guard: maximum Time-Values per Weekly_Schedule day (resizable

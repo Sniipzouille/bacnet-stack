@@ -1491,6 +1491,48 @@ static BACNET_ERROR_CODE Schedule_Exception_Schedule_Element_Write(
 
     return ERROR_CODE_SUCCESS;
 }
+
+/**
+ * @brief Write the whole Exception_Schedule array: count the encoded
+ *  elements, resize the array to that count, then store each element.
+ * @param object_instance [in] BACnet object instance number
+ * @param apdu [in] encoded elements
+ * @param apdu_size [in] size of the encoded elements
+ * @return BACNET_ERROR_CODE value
+ */
+static BACNET_ERROR_CODE Schedule_Exception_Schedule_Write_All(
+    uint32_t object_instance, uint8_t *apdu, size_t apdu_size)
+{
+    BACNET_ERROR_CODE error_code;
+    BACNET_UNSIGNED_INTEGER count = 0;
+    BACNET_UNSIGNED_INTEGER index;
+    size_t offset = 0;
+    int len;
+
+    while (offset < apdu_size) {
+        len = Schedule_Exception_Schedule_Element_Length(
+            object_instance, &apdu[offset], apdu_size - offset);
+        if (len <= 0) {
+            return ERROR_CODE_INVALID_DATA_TYPE;
+        }
+        offset += (size_t)len;
+        count++;
+    }
+    error_code = Schedule_Exception_Schedule_Element_Write(
+        object_instance, 0, count, NULL, 0);
+    offset = 0;
+    for (index = 1; (error_code == ERROR_CODE_SUCCESS) && (index <= count);
+         index++) {
+        len = Schedule_Exception_Schedule_Element_Length(
+            object_instance, &apdu[offset], apdu_size - offset);
+        error_code = Schedule_Exception_Schedule_Element_Write(
+            object_instance, (BACNET_ARRAY_INDEX)index, count, &apdu[offset],
+            (size_t)len);
+        offset += (size_t)len;
+    }
+
+    return error_code;
+}
 #endif
 
 /**
@@ -2259,12 +2301,20 @@ bool Schedule_Write_Property(BACNET_WRITE_PROPERTY_DATA *wp_data)
             break;
 #if BACNET_EXCEPTION_SCHEDULE_SIZE
         case PROP_EXCEPTION_SCHEDULE:
-            wp_data->error_code = bacnet_array_write_resizable(
-                wp_data->object_instance, wp_data->array_index,
-                Schedule_Exception_Schedule_Element_Length,
-                Schedule_Exception_Schedule_Element_Write,
-                Schedule_Exception_Schedule_Count(wp_data->object_instance),
-                wp_data->application_data, wp_data->application_data_len);
+            if (wp_data->array_index == BACNET_ARRAY_ALL) {
+                /* the generic helper loops over the current (empty) array
+                   size and silently stores nothing; size from the data */
+                wp_data->error_code = Schedule_Exception_Schedule_Write_All(
+                    wp_data->object_instance, wp_data->application_data,
+                    wp_data->application_data_len);
+            } else {
+                wp_data->error_code = bacnet_array_write_resizable(
+                    wp_data->object_instance, wp_data->array_index,
+                    Schedule_Exception_Schedule_Element_Length,
+                    Schedule_Exception_Schedule_Element_Write,
+                    Schedule_Exception_Schedule_Count(wp_data->object_instance),
+                    wp_data->application_data, wp_data->application_data_len);
+            }
             if (wp_data->error_code == ERROR_CODE_SUCCESS) {
                 status = true;
             }

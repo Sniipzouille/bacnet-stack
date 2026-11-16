@@ -23,6 +23,8 @@
 #include "bacnet/iam.h"
 #include "bacnet/npdu.h"
 #include "bacnet/version.h"
+#include "bacnet/wp.h"
+#include "bacnet/basic/object/schedule.h"
 /* some demo stuff needed */
 #include "bacnet/basic/binding/address.h"
 #include "bacnet/basic/services.h"
@@ -158,17 +160,150 @@ static void Structured_View_Update(void)
         instance, BACNET_RELATIONSHIP_CONTAINS);
 }
 
+/* verbose request logging; set environment variable BACNET_VERBOSE=0 to mute */
+static bool Verbose_Enabled(void)
+{
+    static int enabled = -1;
+    const char *env;
+
+    if (enabled < 0) {
+        env = getenv("BACNET_VERBOSE");
+        enabled = !((env != NULL) && (env[0] == '0'));
+    }
+
+    return enabled != 0;
+}
+
+static void Log_Request(
+    const char *name,
+    uint16_t service_len,
+    const BACNET_ADDRESS *src,
+    const BACNET_CONFIRMED_SERVICE_DATA *service_data)
+{
+    unsigned i;
+
+    if (!Verbose_Enabled()) {
+        return;
+    }
+    printf(
+        "[REQ] %s invoke-id=%u len=%u from net=%u mac=", name,
+        (unsigned)service_data->invoke_id, (unsigned)service_len,
+        (unsigned)src->net);
+    for (i = 0; i < src->mac_len; i++) {
+        printf("%02X", (unsigned)src->mac[i]);
+    }
+    printf("\n");
+    fflush(stdout);
+}
+
+static void Verbose_Read_Property(
+    uint8_t *service_request,
+    uint16_t service_len,
+    BACNET_ADDRESS *src,
+    BACNET_CONFIRMED_SERVICE_DATA *service_data)
+{
+    Log_Request("ReadProperty", service_len, src, service_data);
+    handler_read_property(service_request, service_len, src, service_data);
+}
+
+static void Verbose_Read_Property_Multiple(
+    uint8_t *service_request,
+    uint16_t service_len,
+    BACNET_ADDRESS *src,
+    BACNET_CONFIRMED_SERVICE_DATA *service_data)
+{
+    Log_Request("ReadPropertyMultiple", service_len, src, service_data);
+    handler_read_property_multiple(
+        service_request, service_len, src, service_data);
+}
+
+static void Verbose_Write_Property(
+    uint8_t *service_request,
+    uint16_t service_len,
+    BACNET_ADDRESS *src,
+    BACNET_CONFIRMED_SERVICE_DATA *service_data)
+{
+    BACNET_WRITE_PROPERTY_DATA wp_data = { 0 };
+    int len;
+
+    Log_Request("WriteProperty", service_len, src, service_data);
+    if (Verbose_Enabled()) {
+        len = wp_decode_service_request(service_request, service_len, &wp_data);
+        if (len > 0) {
+            printf(
+                "[REQ]   %s-%lu %s array-index=%ld priority=%u "
+                "data-len=%d\n",
+                bactext_object_type_name(wp_data.object_type),
+                (unsigned long)wp_data.object_instance,
+                bactext_property_name(wp_data.object_property),
+                (wp_data.array_index == BACNET_ARRAY_ALL)
+                    ? -1L
+                    : (long)wp_data.array_index,
+                (unsigned)wp_data.priority, wp_data.application_data_len);
+        } else {
+            printf("[REQ]   WriteProperty decode failed (%d)\n", len);
+        }
+    }
+    handler_write_property(service_request, service_len, src, service_data);
+#if BACNET_EXCEPTION_SCHEDULE_SIZE
+    if (Verbose_Enabled() && (len > 0) &&
+        (wp_data.object_type == OBJECT_SCHEDULE) &&
+        (wp_data.object_property == PROP_EXCEPTION_SCHEDULE)) {
+        printf(
+            "[REQ]   Exception_Schedule now holds %u entries\n",
+            Schedule_Exception_Schedule_Count(wp_data.object_instance));
+    }
+#endif
+    fflush(stdout);
+}
+
+static void Verbose_Write_Property_Multiple(
+    uint8_t *service_request,
+    uint16_t service_len,
+    BACNET_ADDRESS *src,
+    BACNET_CONFIRMED_SERVICE_DATA *service_data)
+{
+    Log_Request("WritePropertyMultiple", service_len, src, service_data);
+    handler_write_property_multiple(
+        service_request, service_len, src, service_data);
+}
+
+static void Verbose_Create_Object(
+    uint8_t *service_request,
+    uint16_t service_len,
+    BACNET_ADDRESS *src,
+    BACNET_CONFIRMED_SERVICE_DATA *service_data)
+{
+    Log_Request("CreateObject", service_len, src, service_data);
+    handler_create_object(service_request, service_len, src, service_data);
+}
+
+static void Verbose_Delete_Object(
+    uint8_t *service_request,
+    uint16_t service_len,
+    BACNET_ADDRESS *src,
+    BACNET_CONFIRMED_SERVICE_DATA *service_data)
+{
+    Log_Request("DeleteObject", service_len, src, service_data);
+    handler_delete_object(service_request, service_len, src, service_data);
+}
+
 /** Initialize the handlers we will utilize.
  * @see Device_Init, apdu_set_unconfirmed_handler, apdu_set_confirmed_handler
  */
 static void Init_Service_Handlers(void)
 {
     BACNET_CREATE_OBJECT_DATA object_data = { 0 };
+#ifdef SERVER_STATIC_OBJECTS
     unsigned int i = 0;
+#endif
 
     /* Initialize the device object and its children */
     Device_Init(NULL);
-    /* create some dynamically created objects as examples */
+#ifdef SERVER_STATIC_OBJECTS
+    /* Build with -DSERVER_STATIC_OBJECTS to create one instance of every
+       object type at startup. By default none are created; clients can
+       add them with CreateObject. */
     object_data.object_instance = BACNET_MAX_INSTANCE;
     for (i = 0; i < BACNET_OBJECT_TYPE_RESERVED_MIN; i++) {
         object_data.object_type = i;
@@ -181,9 +316,11 @@ static void Init_Service_Handlers(void)
                 bactext_error_code_name(object_data.error_code));
         }
     }
+#endif
 #if defined BACNET_BACKUP_RESTORE
     /* initialize the POSIX file object backend */
     bacfile_posix_init();
+#ifdef SERVER_STATIC_OBJECTS
     /* file for backup and restore example */
     object_data.object_instance = bacfile_index_to_instance(0);
     if (object_data.object_instance < BACNET_MAX_INSTANCE) {
@@ -196,6 +333,7 @@ static void Init_Service_Handlers(void)
             bacfile_pathname(object_data.object_instance), bacfile_count());
     }
 #endif
+#endif
     /* set up our confirmed service unrecognized service handler - required! */
     apdu_set_unrecognized_service_handler_handler(handler_unrecognized_service);
     /* we need to handle who-is to support dynamic device binding */
@@ -205,13 +343,13 @@ static void Init_Service_Handlers(void)
     /* Set the handlers for any confirmed services that we support. */
     /* We must implement read property - it's required! */
     apdu_set_confirmed_handler(
-        SERVICE_CONFIRMED_READ_PROPERTY, handler_read_property);
+        SERVICE_CONFIRMED_READ_PROPERTY, Verbose_Read_Property);
     apdu_set_confirmed_handler(
-        SERVICE_CONFIRMED_READ_PROP_MULTIPLE, handler_read_property_multiple);
+        SERVICE_CONFIRMED_READ_PROP_MULTIPLE, Verbose_Read_Property_Multiple);
     apdu_set_confirmed_handler(
-        SERVICE_CONFIRMED_WRITE_PROPERTY, handler_write_property);
+        SERVICE_CONFIRMED_WRITE_PROPERTY, Verbose_Write_Property);
     apdu_set_confirmed_handler(
-        SERVICE_CONFIRMED_WRITE_PROP_MULTIPLE, handler_write_property_multiple);
+        SERVICE_CONFIRMED_WRITE_PROP_MULTIPLE, Verbose_Write_Property_Multiple);
     apdu_set_confirmed_handler(
         SERVICE_CONFIRMED_READ_RANGE, handler_read_range);
 #if defined BACNET_BACKUP_RESTORE
@@ -264,9 +402,9 @@ static void Init_Service_Handlers(void)
     handler_timesync_init();
 #endif
     apdu_set_confirmed_handler(
-        SERVICE_CONFIRMED_CREATE_OBJECT, handler_create_object);
+        SERVICE_CONFIRMED_CREATE_OBJECT, Verbose_Create_Object);
     apdu_set_confirmed_handler(
-        SERVICE_CONFIRMED_DELETE_OBJECT, handler_delete_object);
+        SERVICE_CONFIRMED_DELETE_OBJECT, Verbose_Delete_Object);
     /* configure the cyclic timers */
     mstimer_set(&BACnet_Task_Timer, 1000UL);
     mstimer_set(&BACnet_TSM_Timer, 50UL);
