@@ -24,7 +24,9 @@
 #include "bacnet/npdu.h"
 #include "bacnet/version.h"
 #include "bacnet/wp.h"
+#include "bacnet/bacapp.h"
 #include "bacnet/basic/object/schedule.h"
+#include "bacnet/basic/sys/cJSON.h"
 /* some demo stuff needed */
 #include "bacnet/basic/binding/address.h"
 #include "bacnet/basic/services.h"
@@ -80,6 +82,15 @@ static struct mstimer BACnet_Notification_Timer;
 static struct mstimer BACnet_Object_Timer;
 /** Buffer used for receiving */
 static uint8_t Rx_Buf[MAX_MPDU] = { 0 };
+/* SmartCampus: parsed JSON configuration (environment BACNET_OBJECTS_CONFIG) */
+static cJSON *Config_Root;
+#if defined BACNET_BACKUP_RESTORE
+/* SmartCampus: automatic backup of the objects after each change */
+static uint32_t Backup_File_Instance = BACNET_MAX_INSTANCE;
+static bool Backup_Pending;
+static struct mstimer Backup_Timer;
+#endif
+static void Backup_Mark(void);
 
 /* configure an example structured view object subordinate list */
 #if (BACNET_PROTOCOL_REVISION >= 4)
@@ -245,6 +256,7 @@ static void Verbose_Write_Property(
         }
     }
     handler_write_property(service_request, service_len, src, service_data);
+    Backup_Mark();
 #if BACNET_EXCEPTION_SCHEDULE_SIZE
     if (Verbose_Enabled() && (len > 0) &&
         (wp_data.object_type == OBJECT_SCHEDULE) &&
@@ -266,6 +278,7 @@ static void Verbose_Write_Property_Multiple(
     Log_Request("WritePropertyMultiple", service_len, src, service_data);
     handler_write_property_multiple(
         service_request, service_len, src, service_data);
+    Backup_Mark();
 }
 
 static void Verbose_Create_Object(
@@ -276,6 +289,7 @@ static void Verbose_Create_Object(
 {
     Log_Request("CreateObject", service_len, src, service_data);
     handler_create_object(service_request, service_len, src, service_data);
+    Backup_Mark();
 }
 
 static void Verbose_Delete_Object(
@@ -286,7 +300,272 @@ static void Verbose_Delete_Object(
 {
     Log_Request("DeleteObject", service_len, src, service_data);
     handler_delete_object(service_request, service_len, src, service_data);
+    Backup_Mark();
 }
+
+/* ---------------------------------------------------------------------
+ * SmartCampus: objects created at startup from a JSON configuration file
+ * --------------------------------------------------------------------- */
+
+/**
+ * @brief Read and parse the JSON configuration file
+ * @param path [in] path of the JSON file
+ * @return parsed JSON tree, or NULL on error
+ */
+static cJSON *Config_Parse(const char *path)
+{
+    FILE *file;
+    long size;
+    char *text;
+    cJSON *root = NULL;
+
+    file = fopen(path, "rb");
+    if (!file) {
+        fprintf(stderr, "[CFG] cannot open %s\n", path);
+        return NULL;
+    }
+    fseek(file, 0, SEEK_END);
+    size = ftell(file);
+    fseek(file, 0, SEEK_SET);
+    text = calloc((size_t)size + 1, 1);
+    if (text && (fread(text, 1, (size_t)size, file) == (size_t)size)) {
+        root = cJSON_Parse(text);
+        if (!root) {
+            fprintf(
+                stderr, "[CFG] invalid JSON in %s near: %.40s\n", path,
+                cJSON_GetErrorPtr() ? cJSON_GetErrorPtr() : "?");
+        }
+    }
+    free(text);
+    fclose(file);
+
+    return root;
+}
+
+/**
+ * @brief Find the BACnet datatype of a property by reading its current
+ *  value from the object, so any object type works without specific code.
+ * @param object_type [in] BACnet object type
+ * @param object_instance [in] BACnet object instance
+ * @param property [in] BACnet property
+ * @return the application tag of the property, or -1 if unknown
+ */
+static int Config_Property_Tag(
+    BACNET_OBJECT_TYPE object_type,
+    uint32_t object_instance,
+    BACNET_PROPERTY_ID property)
+{
+    BACNET_READ_PROPERTY_DATA rp_data = { 0 };
+    BACNET_APPLICATION_DATA_VALUE value = { 0 };
+    uint8_t apdu[MAX_APDU] = { 0 };
+    int len;
+
+    rp_data.object_type = object_type;
+    rp_data.object_instance = object_instance;
+    rp_data.object_property = property;
+    rp_data.array_index = BACNET_ARRAY_ALL;
+    rp_data.application_data = apdu;
+    rp_data.application_data_len = sizeof(apdu);
+    len = Device_Read_Property(&rp_data);
+    if ((len > 0) &&
+        (bacapp_decode_application_data(apdu, (uint32_t)len, &value) > 0)) {
+        return value.tag;
+    }
+
+    return bacapp_known_property_tag(object_type, property);
+}
+
+/**
+ * @brief Write one property of an object from its JSON value. The BACnet
+ *  datatype is deduced from the current value of the property.
+ * @param object_type [in] BACnet object type
+ * @param object_instance [in] BACnet object instance
+ * @param item [in] JSON item: name is the property, value its value
+ * @return true if the property was written
+ */
+static bool Config_Property_Write(
+    BACNET_OBJECT_TYPE object_type, uint32_t object_instance, cJSON *item)
+{
+    BACNET_APPLICATION_DATA_VALUE value = { 0 };
+    BACNET_WRITE_PROPERTY_DATA wp_data = { 0 };
+    uint32_t property = 0;
+    uint32_t units = 0;
+    char text[32] = "";
+    const char *argument = text;
+    int tag;
+    bool status = false;
+
+    if (!bactext_property_strtol(item->string, &property)) {
+        printf("[CFG]   unknown property %s\n", item->string);
+        return false;
+    }
+    tag = Config_Property_Tag(
+        object_type, object_instance, (BACNET_PROPERTY_ID)property);
+    if (tag < 0) {
+        printf("[CFG]   unsupported property %s\n", item->string);
+        return false;
+    }
+    if (cJSON_IsString(item)) {
+        argument = item->valuestring;
+        if ((property == PROP_UNITS) &&
+            bactext_engineering_unit_index(argument, &units)) {
+            snprintf(text, sizeof(text), "%lu", (unsigned long)units);
+            argument = text;
+        }
+    } else if (cJSON_IsBool(item)) {
+        argument = cJSON_IsTrue(item) ? "1" : "0";
+    } else if (cJSON_IsNumber(item)) {
+        snprintf(text, sizeof(text), "%g", item->valuedouble);
+    } else {
+        printf("[CFG]   %s: value must be a string, number or boolean\n",
+            item->string);
+        return false;
+    }
+    if (bacapp_parse_application_data(
+            (BACNET_APPLICATION_TAG)tag, argument, &value)) {
+        wp_data.object_type = object_type;
+        wp_data.object_instance = object_instance;
+        wp_data.object_property = (BACNET_PROPERTY_ID)property;
+        wp_data.array_index = BACNET_ARRAY_ALL;
+        wp_data.priority = BACNET_MAX_PRIORITY;
+        wp_data.application_data_len =
+            bacapp_encode_application_data(wp_data.application_data, &value);
+        status = Device_Write_Property(&wp_data);
+    }
+    if (status) {
+        printf("[CFG]   %s=%s OK\n", item->string, argument);
+    } else {
+        printf(
+            "[CFG]   %s=%s refused: %s\n", item->string, argument,
+            bactext_error_code_name(wp_data.error_code));
+    }
+
+    return status;
+}
+
+/**
+ * @brief Create the objects listed in the "objects" array of the
+ *  configuration, then write their properties.
+ * @param root [in] parsed JSON configuration
+ */
+static void Config_Objects_Create(cJSON *root)
+{
+    BACNET_CREATE_OBJECT_DATA object_data = { 0 };
+    cJSON *objects, *object, *type, *instance, *properties, *property;
+    uint32_t object_type = 0;
+
+    objects = cJSON_GetObjectItem(root, "objects");
+    cJSON_ArrayForEach(object, objects)
+    {
+        type = cJSON_GetObjectItem(object, "type");
+        instance = cJSON_GetObjectItem(object, "instance");
+        if (!cJSON_IsString(type) || !cJSON_IsNumber(instance) ||
+            !bactext_object_type_strtol(type->valuestring, &object_type)) {
+            printf("[CFG] object ignored: needs a valid \"type\" and "
+                   "\"instance\"\n");
+            continue;
+        }
+        object_data.object_type = (BACNET_OBJECT_TYPE)object_type;
+        object_data.object_instance = (uint32_t)instance->valuedouble;
+        object_data.error_class = ERROR_CLASS_OBJECT;
+        object_data.error_code = ERROR_CODE_SUCCESS;
+        if (!Device_Create_Object(&object_data)) {
+            printf(
+                "[CFG] %s-%lu not created: %s\n", type->valuestring,
+                (unsigned long)object_data.object_instance,
+                bactext_error_code_name(object_data.error_code));
+            continue;
+        }
+        printf(
+            "[CFG] %s-%lu created\n", type->valuestring,
+            (unsigned long)object_data.object_instance);
+        properties = cJSON_GetObjectItem(object, "properties");
+        cJSON_ArrayForEach(property, properties)
+        {
+            Config_Property_Write(
+                object_data.object_type, object_data.object_instance,
+                property);
+        }
+    }
+    fflush(stdout);
+}
+
+/* ---------------------------------------------------------------------
+ * SmartCampus: automatic backup and restore of the objects. The stack
+ * already knows how to save every object as a CreateObject request in a
+ * file (Device_Start_Backup) and to recreate them (Device_End_Restore).
+ * --------------------------------------------------------------------- */
+
+/**
+ * @brief Ask for a backup a short time after a change, so that a burst
+ *  of writes produces a single backup.
+ */
+static void Backup_Mark(void)
+{
+#if defined BACNET_BACKUP_RESTORE
+    Backup_Pending = true;
+    mstimer_set(&Backup_Timer, 2000UL);
+#endif
+}
+
+#if defined BACNET_BACKUP_RESTORE
+/**
+ * @brief Create the File object used for the backup, then restore the
+ *  objects from it if the file is not empty.
+ */
+static void Backup_Init(void)
+{
+    BACNET_CREATE_OBJECT_DATA object_data = { 0 };
+    const char *pathname;
+
+    pathname = getenv("BACNET_BACKUP_FILE");
+    if (!pathname || !pathname[0]) {
+        pathname = "backup_1.bin";
+    }
+    object_data.object_type = OBJECT_FILE;
+    object_data.object_instance = BACNET_MAX_INSTANCE;
+    if (!Device_Create_Object(&object_data)) {
+        printf("[BACKUP] cannot create the backup File object\n");
+        return;
+    }
+    Backup_File_Instance = object_data.object_instance;
+    bacfile_pathname_set(Backup_File_Instance, pathname);
+    Device_Configuration_File_Set(0, Backup_File_Instance);
+    if (bacfile_file_size(Backup_File_Instance) > 0) {
+        Device_Start_Restore();
+        Device_End_Restore();
+        printf(
+            "[BACKUP] objects restored from %s (%s)\n", pathname,
+            (Device_Backup_And_Restore_State() == BACKUP_STATE_IDLE)
+                ? "OK"
+                : "failure");
+    } else {
+        printf("[BACKUP] no backup in %s yet\n", pathname);
+    }
+    fflush(stdout);
+}
+
+/**
+ * @brief Write all the objects to the backup file when a change is pending
+ */
+static void Backup_Task(void)
+{
+    if (!Backup_Pending || !mstimer_expired(&Backup_Timer) ||
+        (Backup_File_Instance == BACNET_MAX_INSTANCE)) {
+        return;
+    }
+    Backup_Pending = false;
+    bacfile_file_size_set(Backup_File_Instance, 0);
+    Device_Start_Backup();
+    Device_Backup_And_Restore_State_Set(BACKUP_STATE_IDLE);
+    printf(
+        "[BACKUP] %lu objects saved in %s (%lu bytes)\n",
+        (unsigned long)Device_Object_List_Count(),
+        bacfile_pathname(Backup_File_Instance),
+        (unsigned long)bacfile_file_size(Backup_File_Instance));
+    fflush(stdout);
+}
+#endif
 
 /** Initialize the handlers we will utilize.
  * @see Device_Init, apdu_set_unconfirmed_handler, apdu_set_confirmed_handler
@@ -333,6 +612,13 @@ static void Init_Service_Handlers(void)
             bacfile_pathname(object_data.object_instance), bacfile_count());
     }
 #endif
+#endif
+    /* SmartCampus: objects from the configuration, then the last backup */
+    if (Config_Root) {
+        Config_Objects_Create(Config_Root);
+    }
+#if defined BACNET_BACKUP_RESTORE && !defined SERVER_STATIC_OBJECTS
+    Backup_Init();
 #endif
     /* set up our confirmed service unrecognized service handler - required! */
     apdu_set_unrecognized_service_handler_handler(handler_unrecognized_service);
@@ -469,6 +755,9 @@ int main(int argc, char *argv[])
 #endif
     int argi = 0;
     const char *filename = NULL;
+    const char *config_path = NULL;
+    cJSON *config_device = NULL;
+    cJSON *config_item = NULL;
 
     filename = filename_remove_path(argv[0]);
     for (argi = 1; argi < argc; argi++) {
@@ -486,6 +775,19 @@ int main(int argc, char *argv[])
                    "FITNESS FOR A PARTICULAR PURPOSE.\n");
             return 0;
         }
+    }
+    /* SmartCampus: optional JSON configuration of the device and objects */
+    config_path = getenv("BACNET_OBJECTS_CONFIG");
+    if (config_path && config_path[0]) {
+        Config_Root = Config_Parse(config_path);
+        if (Config_Root) {
+            printf("[CFG] configuration loaded from %s\n", config_path);
+        }
+    }
+    config_device = cJSON_GetObjectItem(Config_Root, "device");
+    config_item = cJSON_GetObjectItem(config_device, "instance");
+    if ((argc <= 1) && cJSON_IsNumber(config_item)) {
+        Device_Set_Object_Instance_Number((uint32_t)config_item->valuedouble);
     }
 #if defined(BAC_UCI)
     ctx = ucix_init("bacnet_dev");
@@ -531,8 +833,11 @@ int main(int argc, char *argv[])
         Device_Object_Name_ANSI_Init(uciname);
     } else {
 #endif /* defined(BAC_UCI) */
+        config_item = cJSON_GetObjectItem(config_device, "name");
         if (argc > 2) {
             Device_Object_Name_ANSI_Init(argv[2]);
+        } else if (cJSON_IsString(config_item)) {
+            Device_Object_Name_ANSI_Init(config_item->valuestring);
         }
 #if defined(BAC_UCI)
     }
@@ -583,6 +888,9 @@ int main(int argc, char *argv[])
             dlenv_maintenance_timer(elapsed_seconds);
             handler_cov_timer_seconds(elapsed_seconds);
             trend_log_timer(elapsed_seconds);
+#if defined BACNET_BACKUP_RESTORE && !defined SERVER_STATIC_OBJECTS
+            Backup_Task();
+#endif
 #if defined(INTRINSIC_REPORTING)
             Device_local_reporting();
 #endif

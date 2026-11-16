@@ -1,0 +1,47 @@
+{
+  "device": {
+    "instance": 1234,
+    "name": "SmartCampus"
+  },
+  "static": {
+    "trend-log": 0,
+    "access-credential": 0,
+    "access-door": 0,
+    "access-point": 0,
+    "access-rights": 0,
+    "access-user": 0,
+    "access-zone": 0,
+    "credential-data-input": 0
+  },
+  "objects": [
+    {
+      "type": "analog-value",
+      "instance": 1,
+      "properties": {
+        "object-name": "Consigne-B12",
+        "description": "Consigne de chauffage salle B12",
+        "units": "degrees-celsius",
+        "present-value": 19.0
+      }
+    },
+    {
+      "type": "analog-value",
+      "instance": 2,
+      "properties": {
+        "object-name": "Temperature-B12",
+        "description": "Temperature mesuree par la vanne de la salle B12",
+        "units": "degrees-celsius",
+        "present-value": 18.5
+      }
+    },
+    {
+      "type": "binary-value",
+      "instance": 1,
+      "properties": {
+        "object-name": "Occupation-B12",
+        "description": "Salle B12 occupee selon l'emploi du temps",
+        "present-value": 0
+      }
+    }
+  ]
+}
